@@ -10,33 +10,32 @@ use std::path::PathBuf;
 
 use crate::utils::extract_param_from_url;
 
+/// Constant for the Claude usage URL
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
-
 const ANTHROPIC_AUTH_URL: &str = "https://claude.ai/oauth/authorize";
-
 const ANTHROPIC_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
-
 const ANTHROPIC_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-
 const ANTHROPIC_AUTH_SCOPE: &str = "user:profile user:inference user:sessions:claude_code";
-
 const OAUTH_REDIRECT_PORT: u16 = 54545;
 
+/// Constants for Claude API error handler
+pub const ANTHROPIC_ERROR_AUTH_EXPIRED: &str = "OAuth token has expired";
+
 // Wrapper for the OAuth credentials of Claude AI.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct ClaudeCredentials {
     pub access_token: String,
     pub refresh_token: String,
 }
 
 // Error details structure for Claude API error responses
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ErrorDetails {
     pub error_visibility: String,
 }
 
 // Error structure for Claude API error responses
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ApiError {
     #[serde(rename = "type")]
     pub error_type: String,
@@ -45,7 +44,7 @@ pub struct ApiError {
 }
 
 // Top-level error response from Claude API
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ClaudeErrorResponse {
     #[serde(rename = "type")]
     pub response_type: String, // "error"
@@ -56,14 +55,14 @@ pub struct ClaudeErrorResponse {
 // It represents the usage period of an account in detail.
 // This struct is used inside the response of the Claude API
 // usage endpoint.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct UsagePeriod {
     pub utilization: f32,
     pub resets_at: Option<String>,
 }
 
 // It is part of the response of the Claude API usage endpoint.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ExtraUsage {
     pub is_enabled: bool,
     pub monthly_limit: Option<u64>,
@@ -72,7 +71,7 @@ pub struct ExtraUsage {
 }
 
 // It is the full response of the Claude API usage endpoint.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ClaudeUsageResponse {
     // Information about the usage of the account (Current session on the tray).
     pub five_hour: UsagePeriod,
@@ -108,6 +107,11 @@ pub struct AnthropicTokenResponse {
     pub account: Account,
 }
 
+pub struct GetUsageError {
+    pub message: String,
+    pub antropic_error_response: Option<ClaudeErrorResponse>,
+}
+
 // Generates a code verifier for OAuth2 authorization.
 pub fn generate_code_verifier() -> String {
     let random_bytes: [u8; 32] = rand::random();
@@ -130,22 +134,22 @@ pub fn generate_code_challenge(code_verifier: &str) -> String {
 }
 
 // Runs a localhost server to wait for the OAuth callback.
-pub async fn wait_for_oauth_callback(expected_state: &str) -> Result<String, String> {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", OAUTH_REDIRECT_PORT))
-        .map_err(|e| format!("failed to bind to port {}: {}", OAUTH_REDIRECT_PORT, e))?;
+pub fn wait_for_oauth_callback(expected_state: &str) -> Result<String, String> {
+    let listener = TcpListener::bind(format!("127.0.0.1:{OAUTH_REDIRECT_PORT}"))
+        .map_err(|e| format!("failed to bind to port {OAUTH_REDIRECT_PORT}: {e}"))?;
 
-    trace!("oauth callback listening on port {}", OAUTH_REDIRECT_PORT);
+    trace!("oauth callback listening on port {OAUTH_REDIRECT_PORT}");
 
     // Waiting for a connection
     let (mut stream, _) = listener
         .accept()
-        .map_err(|e| format!("failed to accept connection: {}", e))?;
+        .map_err(|e| format!("failed to accept connection: {e}"))?;
 
     // Reading a HTTP request
     let mut buffer = [0; 1024];
     stream
         .read(&mut buffer)
-        .map_err(|e| format!("failed to read from stream: {}", e))?;
+        .map_err(|e| format!("failed to read from stream: {e}"))?;
 
     let request = String::from_utf8_lossy(&buffer);
 
@@ -161,7 +165,7 @@ pub async fn wait_for_oauth_callback(expected_state: &str) -> Result<String, Str
 
     stream
         .write_all(response.as_bytes())
-        .map_err(|e| format!("failed to write to stream: {}", e))?;
+        .map_err(|e| format!("failed to write to stream: {e}"))?;
 
     Ok(code)
 }
@@ -174,7 +178,7 @@ async fn exchange_code_for_token(
 ) -> Result<AnthropicTokenResponse, String> {
     let client = reqwest::Client::new();
 
-    let redirect_url = format!("http://localhost:{}/callback", OAUTH_REDIRECT_PORT);
+    let redirect_url = format!("http://localhost:{OAUTH_REDIRECT_PORT}/callback");
 
     let request_body = json!({
         "code": code,
@@ -185,7 +189,7 @@ async fn exchange_code_for_token(
         "code_verifier": code_verifier
     });
 
-    trace!("token exchange request body: {}", request_body);
+    trace!("token exchange request body: {request_body}");
 
     let response = client
         .post(ANTHROPIC_TOKEN_URL)
@@ -194,29 +198,25 @@ async fn exchange_code_for_token(
         .json(&request_body)
         .send()
         .await
-        .map_err(|e| format!("failed to send request: {}", e))?;
+        .map_err(|e| format!("failed to send request: {e}"))?;
 
     let status = response.status();
 
     let response_text = response
         .text()
         .await
-        .map_err(|e| format!("failed to read response: {}", e))?;
+        .map_err(|e| format!("failed to read response: {e}"))?;
 
-    trace!(
-        "token exchange response (status {}): {}",
-        status, response_text
-    );
+    trace!("token exchange response (status {status}): {response_text}");
 
     if !status.is_success() {
         return Err(format!(
-            "token exchange failed with status {}: {}",
-            status, response_text
+            "token exchange failed with status {status}: {response_text}"
         ));
     }
 
     serde_json::from_str::<AnthropicTokenResponse>(&response_text)
-        .map_err(|e| format!("failed to parse token response: {}", e))
+        .map_err(|e| format!("failed to parse token response: {e}"))
 }
 
 // Function to login to Claude API. It opens a terminal executing `claude /login`.
@@ -232,7 +232,7 @@ pub async fn open_oauth_login() -> Result<AnthropicTokenResponse, String> {
 
     trace!("generated pkce verifier and challenge");
 
-    let redirect_url = format!("http://localhost:{}/callback", OAUTH_REDIRECT_PORT);
+    let redirect_url = format!("http://localhost:{OAUTH_REDIRECT_PORT}/callback");
     let auth_url = format!(
         "{}?code=true&client_id={}&response_type=code&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256&state={}",
         ANTHROPIC_AUTH_URL,                        // Url
@@ -244,10 +244,10 @@ pub async fn open_oauth_login() -> Result<AnthropicTokenResponse, String> {
     );
 
     info!("opening browser for authorization");
-    webbrowser::open(&auth_url).map_err(|e| format!("failed to open browser: {}", e))?;
+    webbrowser::open(&auth_url).map_err(|e| format!("failed to open browser: {e}"))?;
 
     info!("waiting for oauth callback");
-    let auth_code = wait_for_oauth_callback(&state).await?;
+    let auth_code = wait_for_oauth_callback(&state)?;
     info!("received authorization code");
 
     info!("exchanging authorization code for tokens");
@@ -258,29 +258,32 @@ pub async fn open_oauth_login() -> Result<AnthropicTokenResponse, String> {
 }
 
 // Function to get the usage of the account. It receives the access token and returns the usage response.
-pub async fn get_usage(access_token: &str) -> Result<ClaudeUsageResponse, String> {
-    info!("getting usage user information from {}", CLAUDE_USAGE_URL);
+pub async fn get_usage(access_token: &str) -> Result<ClaudeUsageResponse, GetUsageError> {
+    info!("getting usage user information from {CLAUDE_USAGE_URL}");
 
     let response = reqwest::Client::new()
         .get(CLAUDE_USAGE_URL)
         .header(
             reqwest::header::AUTHORIZATION,
-            format!("Bearer {}", access_token),
+            format!("Bearer {access_token}"),
         )
         .header("anthropic-beta", "oauth-2025-04-20")
         .header(reqwest::header::USER_AGENT, "claude-code/2.0.61")
         .header(reqwest::header::ACCEPT, "application/json")
         .send()
         .await
-        .map_err(|e| format!("error requesting usage: {}", e))?;
+        .map_err(|e| GetUsageError {
+            message: format!("error requesting usage: {e}"),
+            antropic_error_response: None,
+        })?;
 
     let status = response.status();
-    let response_text = response
-        .text()
-        .await
-        .map_err(|e| format!("error reading response text: {}", e))?;
+    let response_text = response.text().await.map_err(|e| GetUsageError {
+        message: format!("error reading response text: {e}"),
+        antropic_error_response: None,
+    })?;
 
-    info!("request response (status {}): {}", status, response_text);
+    info!("request response (status {status}): {response_text}");
 
     // Try to parse as success response first
     if let Ok(usage) = serde_json::from_str::<ClaudeUsageResponse>(&response_text) {
@@ -288,15 +291,23 @@ pub async fn get_usage(access_token: &str) -> Result<ClaudeUsageResponse, String
     }
 
     if let Ok(error_response) = serde_json::from_str::<ClaudeErrorResponse>(&response_text) {
-        return Err(format!(
-            "api error ({}): {} [request_id: {}]",
-            error_response.error.error_type,
-            error_response.error.message,
-            error_response.request_id
-        ));
+        let antropic_error_response = Some(error_response.clone());
+
+        return Err(GetUsageError {
+            message: format!(
+                "api error ({}): {} [request_id: {}]",
+                error_response.error.error_type,
+                error_response.error.message,
+                error_response.request_id
+            ),
+            antropic_error_response,
+        });
     }
 
-    Err(format!("unexpected api response format: {}", response_text))
+    Err(GetUsageError {
+        message: format!("unexpected api response format: {response_text}"),
+        antropic_error_response: None,
+    })
 }
 
 // Function to get the credentials of the account. By default, the
@@ -305,24 +316,18 @@ pub fn get_local_credentials() -> Result<ClaudeCredentials, String> {
     trace!("getting $HOME environment variable");
 
     let env_home =
-        std::env::var("HOME").map_err(|e| format!("home environment variable not set: {}", e))?;
+        std::env::var("HOME").map_err(|e| format!("home environment variable not set: {e}"))?;
 
-    trace!(
-        "reading credentials file located in {}/.config/claude-tray/credentials.json",
-        env_home
-    );
+    trace!("reading credentials file located in {env_home}/.config/claude-tray/credentials.json");
 
     let credentials =
-        fs::read_to_string(format!("{}/.config/claude-tray/credentials.json", env_home))
-            .map_err(|e| format!("failed to read credentials file: {}", e))?;
+        fs::read_to_string(format!("{env_home}/.config/claude-tray/credentials.json"))
+            .map_err(|e| format!("failed to read credentials file: {e}"))?;
 
     let credentials: ClaudeCredentials = serde_json::from_str(&credentials)
-        .map_err(|e| format!("error getting credentials: {}", e))?;
+        .map_err(|e| format!("error getting credentials: {e}"))?;
 
-    info!(
-        "credentials found in {}/.config/claude-tray/credentials.json",
-        env_home
-    );
+    info!("credentials found in {env_home}/.config/claude-tray/credentials.json");
 
     Ok(credentials)
 }
@@ -330,17 +335,17 @@ pub fn get_local_credentials() -> Result<ClaudeCredentials, String> {
 // Store the credentials in the file credentials.json
 pub fn save_credentials_locally(credentials: &AnthropicTokenResponse) -> Result<(), String> {
     let env_home =
-        std::env::var("HOME").map_err(|e| format!("home environment variable not set: {}", e))?;
+        std::env::var("HOME").map_err(|e| format!("home environment variable not set: {e}"))?;
 
     let config_dir = PathBuf::from(env_home).join(".config/claude-tray");
 
-    trace!("saving credentials to {:?}", config_dir);
+    trace!("saving credentials to {}", config_dir.display());
 
     if !config_dir.exists() {
         info!("credentials file not exists. creating new file");
 
         fs::create_dir_all(&config_dir)
-            .map_err(|e| format!("failed to create config directory: {}", e))?;
+            .map_err(|e| format!("failed to create config directory: {e}"))?;
     }
 
     let credentials_json = ClaudeCredentials {
@@ -349,12 +354,12 @@ pub fn save_credentials_locally(credentials: &AnthropicTokenResponse) -> Result<
     };
 
     let json_fmt = serde_json::to_string_pretty(&credentials_json)
-        .map_err(|e| format!("failed to serialize credentials: {}", e))?;
+        .map_err(|e| format!("failed to serialize credentials: {e}"))?;
 
     let credentials_file = config_dir.join("credentials.json");
 
     fs::write(&credentials_file, json_fmt)
-        .map_err(|e| format!("failed to write credentials file: {}", e))?;
+        .map_err(|e| format!("failed to write credentials file: {e}"))?;
 
     info!("credentials saved successfully");
 

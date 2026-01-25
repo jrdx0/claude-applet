@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use crate::claude;
-use crate::config::Config;
-use cosmic::cosmic_config::{self, CosmicConfigEntry};
+use crate::claude_monitor::claude_usage_monitoring;
 use cosmic::iced::{Length, Limits, Subscription, window::Id};
 use cosmic::iced_winit::commands::popup::{destroy_popup, get_popup};
 use cosmic::prelude::*;
 use cosmic::widget;
-use futures_util::SinkExt;
 
 /// The application model stores app-specific state used to describe its interface and
 /// drive its logic.
@@ -18,15 +16,13 @@ pub struct AppModel {
     /// The popup id.
     popup: Option<Id>,
     /// Configuration data that persists between application runs.
-    config: Config,
-    /// Example progress value (0.0 to 1.0).
+    /// Daily usage information
     daily_usage: f32,
-    /// Example progress value (0.0 to 1.0).
     weekly_usage: f32,
     /// Controls visibility of usage progress bars.
     is_usage_visible: bool,
     /// Token for accessing the API.
-    access_token: String,
+    access_token: claude::ClaudeCredentials,
 }
 
 /// Messages emitted by the application and its widgets.
@@ -34,10 +30,11 @@ pub struct AppModel {
 pub enum Message {
     TogglePopup,
     PopupClosed(Id),
-    SubscriptionChannel,
-    UpdateConfig(Config),
     LoginClicked,
     LoginCompleted(claude::AnthropicTokenResponse),
+    UpdateUsage(claude::ClaudeUsageResponse),
+    RefreshToken,
+    GetLocalCredentials,
     ThrowError(String),
 }
 
@@ -71,25 +68,16 @@ impl cosmic::Application for AppModel {
         // Construct the app model with the runtime's core.
         let app = AppModel {
             core,
-            config: cosmic_config::Config::new(Self::APP_ID, Config::VERSION)
-                .map(|context| match Config::get_entry(&context) {
-                    Ok(config) => config,
-                    Err((_errors, config)) => {
-                        // for why in errors {
-                        //     tracing::error!(%why, "error loading app config");
-                        // }
-
-                        config
-                    }
-                })
-                .unwrap_or_default(),
-            daily_usage: 0.65,       // Example: 65% daily usage
-            weekly_usage: 0.45,      // Example: 45% weekly usage
-            is_usage_visible: false, // Show usage by default
+            daily_usage: 0.0,
+            weekly_usage: 0.0,
+            is_usage_visible: false,
             ..Default::default()
         };
 
-        (app, Task::none())
+        // Check for saved credentials on startup
+        let command = Task::done(cosmic::Action::App(Message::GetLocalCredentials));
+
+        (app, command)
     }
 
     fn on_close_requested(&self, id: Id) -> Option<Message> {
@@ -129,9 +117,7 @@ impl cosmic::Application for AppModel {
                     .push(widget::progress_bar(0.0..=1.0, self.weekly_usage).height(6.0))
                     .push(widget::text(format!("{:.0}%", self.weekly_usage * 100.0))),
             ));
-        }
-
-        if !self.is_usage_visible {
+        } else {
             content_list = content_list.add(widget::container(
                 widget::column().spacing(10).push(
                     widget::button::standard("Login")
@@ -152,29 +138,27 @@ impl cosmic::Application for AppModel {
     /// activated by selectively appending to the subscription batch, and will
     /// continue to execute for the duration that they remain in the batch.
     fn subscription(&self) -> Subscription<Self::Message> {
-        struct MySubscription;
+        struct UsageMonitor;
 
-        Subscription::batch(vec![
-            // Create a subscription which emits updates through a channel.
-            Subscription::run_with_id(
-                std::any::TypeId::of::<MySubscription>(),
-                cosmic::iced::stream::channel(4, move |mut channel| async move {
-                    _ = channel.send(Message::SubscriptionChannel).await;
+        let mut subscriptions = vec![];
 
-                    futures_util::future::pending().await
+        // Only run monitoring subscription if user is logged in
+        if self.is_usage_visible && !self.access_token.access_token.is_empty() {
+            let access_token = self.access_token.clone();
+
+            subscriptions.push(Subscription::run_with_id(
+                std::any::TypeId::of::<UsageMonitor>(),
+                cosmic::iced::stream::channel(10, move |mut channel| {
+                    let token = access_token.access_token.clone();
+
+                    async move {
+                        claude_usage_monitoring(token, &mut channel).await;
+                    }
                 }),
-            ),
-            // Watch for application configuration changes.
-            self.core()
-                .watch_config::<Config>(Self::APP_ID)
-                .map(|update| {
-                    // for why in update.errors {
-                    //     tracing::error!(?why, "app config error");
-                    // }
+            ));
+        }
 
-                    Message::UpdateConfig(update.config)
-                }),
-        ])
+        Subscription::batch(subscriptions)
     }
 
     /// Handles messages emitted by the application and its widgets.
@@ -184,13 +168,22 @@ impl cosmic::Application for AppModel {
     /// tasks are finished.
     fn update(&mut self, message: Self::Message) -> Task<cosmic::Action<Self::Message>> {
         match message {
-            Message::SubscriptionChannel => {
-                // For example purposes only.
-            }
-            Message::UpdateConfig(config) => {
-                self.config = config;
+            Message::GetLocalCredentials => {
+                log::info!("checking for local credentials");
+                match claude::get_local_credentials() {
+                    Ok(credentials) => {
+                        log::info!("local credentials found, logging in automatically");
+                        self.access_token = credentials;
+                        self.is_usage_visible = true;
+                    }
+                    Err(error) => {
+                        log::debug!("no local credentials found: {error}");
+                        let _ = cosmic::Action::App(Message::ThrowError(error));
+                    }
+                }
             }
             Message::LoginClicked => {
+                log::info!("login button clicked, starting oauth flow");
                 return Task::perform(claude::open_oauth_login(), |oauth_response| {
                     match oauth_response {
                         Ok(authorization) => {
@@ -201,10 +194,25 @@ impl cosmic::Application for AppModel {
                 });
             }
             Message::LoginCompleted(authorization) => {
+                log::info!("login completed successfully, saving credentials");
                 let _ = claude::save_credentials_locally(&authorization);
 
-                self.access_token = authorization.access_token;
+                self.access_token = claude::ClaudeCredentials {
+                    access_token: authorization.access_token,
+                    refresh_token: authorization.refresh_token,
+                };
                 self.is_usage_visible = true;
+                log::info!("user authenticated, monitoring will start");
+            }
+            Message::RefreshToken => {}
+            Message::UpdateUsage(usage_data) => {
+                log::debug!(
+                    "updating ui with usage data: daily={:.0}%, weekly={:.0}%",
+                    usage_data.five_hour.utilization * 100.0,
+                    usage_data.seven_day.utilization * 100.0
+                );
+                self.daily_usage = usage_data.five_hour.utilization;
+                self.weekly_usage = usage_data.seven_day.utilization;
             }
             Message::TogglePopup => {
                 return if let Some(p) = self.popup.take() {
@@ -233,7 +241,7 @@ impl cosmic::Application for AppModel {
                 }
             }
             Message::ThrowError(error) => {
-                log::error!("Failed to process: {}", error);
+                log::error!("error occurred: {error}");
             }
         }
         Task::none()
