@@ -365,3 +365,38 @@ pub fn save_credentials_locally(credentials: &AnthropicTokenResponse) -> Result<
 
     Ok(())
 }
+
+// Refresh credentials using the provided refresh token
+pub async fn refresh_credentials(refresh_token: String) -> Result<AnthropicTokenResponse, String> {
+    let response = reqwest::Client::new()
+        .post(ANTHROPIC_TOKEN_URL)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .json(&serde_json::json!({
+            "client_id": ANTHROPIC_CLIENT_ID,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Token refresh request failed: {e}"))?;
+
+    let status = response.status();
+
+    if !status.is_success() {
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown error".to_string());
+        return Err(format!(
+            "Token refresh failed with status {status}: {error_text}"
+        ));
+    }
+
+    let token_response = response
+        .json::<AnthropicTokenResponse>()
+        .await
+        .map_err(|e| format!("Failed to parse token response: {e}"))?;
+
+    Ok(token_response)
+}

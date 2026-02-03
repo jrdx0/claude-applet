@@ -34,6 +34,7 @@ pub enum Message {
     LoginCompleted(claude::AnthropicTokenResponse),
     UpdateUsage(claude::ClaudeUsageResponse),
     RefreshToken,
+    RefreshTokenCompleted(claude::AnthropicTokenResponse),
     GetLocalCredentials,
     ThrowError(String),
 }
@@ -110,12 +111,12 @@ impl cosmic::Application for AppModel {
                     .padding(2)
                     // Daily usage progress bar
                     .push(widget::text("Daily usage"))
-                    .push(widget::progress_bar(0.0..=1.0, self.daily_usage).height(6.0))
-                    .push(widget::text(format!("{:.0}%", self.daily_usage * 100.0)))
+                    .push(widget::progress_bar(0.0..=1.0, self.daily_usage / 100.0).height(6.0))
+                    .push(widget::text(format!("{:.0}%", self.daily_usage)))
                     // Weekly usage progress bar
                     .push(widget::text("Weekly usage"))
-                    .push(widget::progress_bar(0.0..=1.0, self.weekly_usage).height(6.0))
-                    .push(widget::text(format!("{:.0}%", self.weekly_usage * 100.0))),
+                    .push(widget::progress_bar(0.0..=1.0, self.weekly_usage / 100.0).height(6.0))
+                    .push(widget::text(format!("{:.0}%", self.weekly_usage))),
             ));
         } else {
             content_list = content_list.add(widget::container(
@@ -204,12 +205,38 @@ impl cosmic::Application for AppModel {
                 self.is_usage_visible = true;
                 log::info!("user authenticated, monitoring will start");
             }
-            Message::RefreshToken => {}
+            Message::RefreshToken => {
+                log::info!("refreshing token started");
+
+                self.is_usage_visible = false;
+                let refresh_token = self.access_token.refresh_token.clone();
+
+                return Task::perform(
+                    claude::refresh_credentials(refresh_token),
+                    |refreshed_token| match refreshed_token {
+                        Ok(new_credentials) => {
+                            cosmic::Action::App(Message::RefreshTokenCompleted(new_credentials))
+                        }
+                        Err(error) => cosmic::Action::App(Message::ThrowError(error)),
+                    },
+                );
+            }
+            Message::RefreshTokenCompleted(new_credentials) => {
+                log::info!("token refreshed successfully, saving new credentials");
+                let _ = claude::save_credentials_locally(&new_credentials);
+
+                self.access_token = claude::ClaudeCredentials {
+                    access_token: new_credentials.access_token,
+                    refresh_token: new_credentials.refresh_token,
+                };
+                self.is_usage_visible = true;
+                log::info!("token refreshed, monitoring will start");
+            }
             Message::UpdateUsage(usage_data) => {
                 log::debug!(
                     "updating ui with usage data: daily={:.0}%, weekly={:.0}%",
-                    usage_data.five_hour.utilization * 100.0,
-                    usage_data.seven_day.utilization * 100.0
+                    usage_data.five_hour.utilization,
+                    usage_data.seven_day.utilization
                 );
                 self.daily_usage = usage_data.five_hour.utilization;
                 self.weekly_usage = usage_data.seven_day.utilization;
